@@ -1,9 +1,12 @@
+
 import json
 import os
 import random
+from collections import defaultdict
 from typing import Dict, List, Tuple, Set
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import networkx as nx
 import pandas as pd
 import streamlit as st
@@ -23,7 +26,24 @@ STATE_FILE = "hazmat_game_state.json"
 RNG_SEED = 42
 RISK_DAMAGE_MULTIPLIER = 120
 
+ROUTE_COLORS = [
+    "#ff7f0e", "#1f77b4", "#2ca02c", "#d62728",
+    "#9467bd", "#8c564b", "#e377c2", "#17becf"
+]
+
 st.set_page_config(page_title="Hazmat Attacker–Defender Game", layout="wide")
+
+
+# -----------------------------
+# Node mapping: single ID per node
+# -----------------------------
+def node_to_id(node: Tuple[int, int]) -> int:
+    r, c = node
+    return r * GRID_SIZE + c
+
+
+def id_to_node(node_id: int) -> Tuple[int, int]:
+    return (node_id // GRID_SIZE, node_id % GRID_SIZE)
 
 
 # -----------------------------
@@ -36,18 +56,9 @@ def edge_key(a: Tuple[int, int], b: Tuple[int, int]) -> str:
 
 def edge_label_from_key(key: str) -> str:
     left, right = key.split("|")
-    return f"({left}) ↔ ({right})"
-
-
-def parse_node_sequence(text: str) -> List[Tuple[int, int]]:
-    text = text.replace("->", ";")
-    parts = [p.strip() for p in text.split(";") if p.strip()]
-    nodes = []
-    for part in parts:
-        x_str, y_str = [t.strip() for t in part.split(",")]
-        x, y = int(x_str), int(y_str)
-        nodes.append((x, y))
-    return nodes
+    a = tuple(map(int, left.split(",")))
+    b = tuple(map(int, right.split(",")))
+    return f"{node_to_id(a)} ↔ {node_to_id(b)}"
 
 
 def is_adjacent(a: Tuple[int, int], b: Tuple[int, int]) -> bool:
@@ -58,9 +69,9 @@ def validate_route(nodes: List[Tuple[int, int]], grid_size: int = GRID_SIZE) -> 
     if len(nodes) < 2:
         return False, "Route must contain at least two nodes."
     if nodes[0] != (0, 0):
-        return False, "Route must start at the origin (0,0)."
+        return False, "Route must start at node 0."
     if nodes[-1] != (grid_size - 1, grid_size - 1):
-        return False, f"Route must end at the destination ({grid_size-1},{grid_size-1})."
+        return False, f"Route must end at node {grid_size * grid_size - 1}."
 
     for n in nodes:
         if not (0 <= n[0] < grid_size and 0 <= n[1] < grid_size):
@@ -68,7 +79,7 @@ def validate_route(nodes: List[Tuple[int, int]], grid_size: int = GRID_SIZE) -> 
 
     for i in range(len(nodes) - 1):
         if not is_adjacent(nodes[i], nodes[i + 1]):
-            return False, f"Nodes {nodes[i]} and {nodes[i+1]} are not adjacent."
+            return False, f"Nodes {node_to_id(nodes[i])} and {node_to_id(nodes[i+1])} are not adjacent."
 
     return True, "Valid route."
 
@@ -139,8 +150,14 @@ def build_network(grid_size: int = GRID_SIZE, seed: int = RNG_SEED):
     return G, edge_data
 
 
-def draw_network(G, edge_data, highlight_edges: Set[str] = None, attack_edges: Set[str] = None):
-    highlight_edges = highlight_edges or set()
+def draw_network(
+    G,
+    edge_data,
+    route_specs: List[Dict] = None,
+    attack_edges: Set[str] = None,
+    show_legend: bool = False,
+):
+    route_specs = route_specs or []
     attack_edges = attack_edges or set()
 
     pos = {(i, j): (j, -i) for i, j in G.nodes()}
@@ -155,29 +172,53 @@ def draw_network(G, edge_data, highlight_edges: Set[str] = None, attack_edges: S
         else:
             node_colors.append("lightblue")
 
-    nx.draw_networkx_nodes(G, pos, node_size=550, node_color=node_colors, ax=ax)
-    nx.draw_networkx_labels(G, pos, font_size=9, font_weight="bold", ax=ax)
+    nx.draw_networkx_nodes(G, pos, node_size=650, node_color=node_colors, ax=ax)
 
-    base_edges = []
-    base_colors = []
-    base_widths = []
-    for u, v, data in G.edges(data=True):
-        key = data["key"]
-        base_edges.append((u, v))
-        if key in attack_edges and key in highlight_edges:
-            base_colors.append("purple")
-            base_widths.append(4.8)
-        elif key in attack_edges:
-            base_colors.append("red")
-            base_widths.append(3.8)
-        elif key in highlight_edges:
-            base_colors.append("orange")
-            base_widths.append(3.8)
-        else:
-            base_colors.append("gray")
-            base_widths.append(1.5)
+    node_labels = {n: node_to_id(n) for n in G.nodes()}
+    nx.draw_networkx_labels(G, pos, labels=node_labels, font_size=10, font_weight="bold", ax=ax)
 
-    nx.draw_networkx_edges(G, pos, edgelist=base_edges, edge_color=base_colors, width=base_widths, ax=ax)
+    nx.draw_networkx_edges(G, pos, edgelist=list(G.edges()), edge_color="lightgray", width=1.5, ax=ax)
+
+    legend_handles = []
+    edge_volume_usage = defaultdict(int)
+
+    for idx, spec in enumerate(route_specs):
+        color = spec["color"]
+        label = spec["label"]
+        edges_to_draw = []
+        for ekey in spec["edges"]:
+            d = edge_data[ekey]
+            edges_to_draw.append((d["from"], d["to"]))
+            edge_volume_usage[ekey] += spec.get("volume_teu", 0)
+
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edgelist=edges_to_draw,
+            edge_color=color,
+            width=4.0,
+            ax=ax
+        )
+
+        if show_legend:
+            legend_handles.append(Line2D([0], [0], color=color, lw=4, label=label))
+
+    if attack_edges:
+        attacked_edges_to_draw = []
+        for ekey in attack_edges:
+            d = edge_data[ekey]
+            attacked_edges_to_draw.append((d["from"], d["to"]))
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edgelist=attacked_edges_to_draw,
+            edge_color="red",
+            width=5.5,
+            style="dashed",
+            ax=ax
+        )
+        if show_legend:
+            legend_handles.append(Line2D([0], [0], color="red", lw=4, linestyle="--", label="Attacked link"))
 
     edge_labels = {}
     for _, d in edge_data.items():
@@ -190,11 +231,33 @@ def draw_network(G, edge_data, highlight_edges: Set[str] = None, attack_edges: S
         font_size=7,
         rotate=False,
         ax=ax,
-        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.8},
+        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.85},
     )
+
+    if route_specs:
+        volume_edge_labels = {}
+        for ekey, vol in edge_volume_usage.items():
+            if vol > 0:
+                d = edge_data[ekey]
+                volume_edge_labels[(d["from"], d["to"])] = f"V={vol}"
+        nx.draw_networkx_edge_labels(
+            G,
+            pos,
+            edge_labels=volume_edge_labels,
+            font_size=8,
+            font_color="darkgreen",
+            rotate=False,
+            ax=ax,
+            label_pos=0.3,
+            bbox={"facecolor": "white", "edgecolor": "darkgreen", "alpha": 0.75},
+        )
+
+    if show_legend and legend_handles:
+        ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0))
 
     ax.set_title("5×5 Hazmat Network")
     ax.axis("off")
+    plt.tight_layout()
     return fig
 
 
@@ -249,6 +312,18 @@ def evaluate_game(defender_submissions: List[Dict], attacks: List[str], edge_dat
     }
 
 
+def make_route_specs_from_trips(trips: List[Dict]) -> List[Dict]:
+    specs = []
+    for i, trip in enumerate(trips):
+        specs.append({
+            "edges": trip["route_edges"],
+            "color": ROUTE_COLORS[i % len(ROUTE_COLORS)],
+            "label": f"Trip {trip['shipment_id']}: {trip['volume_teu']} TEU",
+            "volume_teu": trip["volume_teu"],
+        })
+    return specs
+
+
 # -----------------------------
 # App
 # -----------------------------
@@ -281,7 +356,7 @@ st.markdown(
     f"""
 **Current mode:** `{state.get("game_mode", "Nash")}`
 
-- Defender moves **{TOTAL_TEU} TEU** from **(0,0)** to **({GRID_SIZE-1},{GRID_SIZE-1})**
+- Defender moves **{TOTAL_TEU} TEU** from node **0** to node **{GRID_SIZE * GRID_SIZE - 1}**
 - Edge labels show:
   - **C = transport cost**
   - **D = attack damage**
@@ -290,9 +365,6 @@ st.markdown(
 """
 )
 
-# -----------------------------
-# Home
-# -----------------------------
 if role == "Home":
     st.subheader("Network")
     fig = draw_network(G, edge_data)
@@ -302,10 +374,10 @@ if role == "Home":
     st.markdown(
         f"""
 1. Choose **Nash** or **Stackelberg** in the sidebar.  
-2. Defender selects vehicles and writes routes as a sequence of nodes.  
-3. Each route must go from **(0,0)** to **({GRID_SIZE-1},{GRID_SIZE-1})**.  
+2. Defender selects vehicles and clicks node buttons to build routes.  
+3. Each route must go from node **0** to node **{GRID_SIZE * GRID_SIZE - 1}**.  
 4. Attacker chooses **1 or 2 links** to attack.  
-5. A link is identified by its two end nodes.  
+5. A link is identified by its two node IDs.  
 6. Referee opens the results page to compare transport cost and attack damage.  
 """
     )
@@ -317,37 +389,33 @@ if role == "Home":
     ])
     st.dataframe(vehicle_df, use_container_width=True)
 
-# -----------------------------
-# Defender
-# -----------------------------
 elif role == "Defender":
     st.subheader("Defender panel")
     st.write(f"Create shipment plans whose total volume equals **{TOTAL_TEU} TEU**.")
 
-    fig = draw_network(G, edge_data)
-    st.pyplot(fig, clear_figure=True)
-
-    st.subheader("Route instructions")
-    st.markdown(
-        f"""
-Write a route as a sequence of nodes, for example:
-
-`0,0 -> 0,1 -> 1,1 -> 2,1 -> 3,1 -> 4,1 -> 4,2 -> 4,3 -> 4,4`
-
-Rules:
-- must start at **(0,0)**
-- must end at **({GRID_SIZE-1},{GRID_SIZE-1})**
-- each step must move to an adjacent node
-"""
-    )
-
     if "defender_working_trips" not in st.session_state:
         st.session_state.defender_working_trips = []
+    if "current_route_nodes" not in st.session_state:
+        st.session_state.current_route_nodes = [(0, 0)]
 
     used_volume = sum(t["volume_teu"] for t in st.session_state.defender_working_trips)
     remaining = TOTAL_TEU - used_volume
 
-    c1, c2 = st.columns([1, 2])
+    current_route_specs = make_route_specs_from_trips(st.session_state.defender_working_trips)
+    fig = draw_network(G, edge_data, route_specs=current_route_specs, show_legend=True)
+    st.pyplot(fig, clear_figure=True)
+
+    st.subheader("Build a route by clicking node IDs")
+    st.markdown(
+        f"""
+- Start node is fixed at **0**
+- End node is **{GRID_SIZE * GRID_SIZE - 1}**
+- Each next node must be adjacent to the previous one
+- Click nodes in order until you reach the final node
+"""
+    )
+
+    c1, c2 = st.columns([1, 1])
     with c1:
         vehicle = st.selectbox("Vehicle", list(VEHICLES.keys()))
         cap = VEHICLES[vehicle]["capacity"]
@@ -360,21 +428,46 @@ Rules:
             disabled=remaining <= 0,
         )
     with c2:
-        route_text = st.text_area(
-            "Route node sequence",
-            value="0,0 -> 0,1 -> 1,1 -> 2,1 -> 3,1 -> 4,1 -> 4,2 -> 4,3 -> 4,4",
-            height=120,
-            disabled=remaining <= 0,
-        )
+        current_route_ids = [node_to_id(n) for n in st.session_state.current_route_nodes]
+        st.markdown(f"**Current route:** {' → '.join(map(str, current_route_ids))}")
 
-    if st.button("Add trip", disabled=remaining <= 0):
-        if volume > cap:
-            st.error(f"{vehicle} cannot carry {volume} TEU.")
-        elif volume > remaining:
-            st.error("This trip exceeds the remaining volume.")
-        else:
-            try:
-                nodes = parse_node_sequence(route_text)
+    st.markdown("**Click nodes to extend the path**")
+    for r in range(GRID_SIZE):
+        cols = st.columns(GRID_SIZE)
+        for c in range(GRID_SIZE):
+            nid = node_to_id((r, c))
+            node = (r, c)
+            last_node = st.session_state.current_route_nodes[-1]
+
+            disabled = False
+            if nid == 0:
+                disabled = len(st.session_state.current_route_nodes) > 1
+            elif not is_adjacent(last_node, node):
+                disabled = True
+
+            if cols[c].button(str(nid), key=f"nodebtn_{r}_{c}", disabled=disabled):
+                st.session_state.current_route_nodes.append(node)
+                st.rerun()
+
+    b1, b2, b3 = st.columns(3)
+    with b1:
+        if st.button("Undo last node", disabled=len(st.session_state.current_route_nodes) <= 1):
+            st.session_state.current_route_nodes = st.session_state.current_route_nodes[:-1]
+            st.rerun()
+    with b2:
+        if st.button("Clear current route"):
+            st.session_state.current_route_nodes = [(0, 0)]
+            st.rerun()
+    with b3:
+        last_id = node_to_id(st.session_state.current_route_nodes[-1])
+        can_add_trip = remaining > 0 and last_id == (GRID_SIZE * GRID_SIZE - 1)
+        if st.button("Add trip", disabled=not can_add_trip):
+            if volume > cap:
+                st.error(f"{vehicle} cannot carry {volume} TEU.")
+            elif volume > remaining:
+                st.error("This trip exceeds the remaining volume.")
+            else:
+                nodes = st.session_state.current_route_nodes
                 valid, msg = validate_route(nodes)
                 if not valid:
                     st.error(msg)
@@ -386,12 +479,13 @@ Rules:
                         "vehicle": vehicle,
                         "volume_teu": int(volume),
                         "route_nodes": nodes,
+                        "route_node_ids": [node_to_id(n) for n in nodes],
                         "route_edges": route_edges,
                         "preview_transport_cost": calc["total_transport_cost"],
                     })
+                    st.session_state.current_route_nodes = [(0, 0)]
                     st.success("Trip added.")
-            except Exception as e:
-                st.error(f"Could not parse route. Error: {e}")
+                    st.rerun()
 
     if st.session_state.defender_working_trips:
         st.subheader("Current trips")
@@ -400,6 +494,7 @@ Rules:
                 "shipment_id": t["shipment_id"],
                 "vehicle": t["vehicle"],
                 "volume_teu": t["volume_teu"],
+                "route_nodes": " → ".join(map(str, t["route_node_ids"])),
                 "edges_in_route": len(t["route_edges"]),
                 "transport_cost_preview": t["preview_transport_cost"],
             }
@@ -407,17 +502,18 @@ Rules:
         ])
         st.dataframe(preview_df, use_container_width=True)
 
-        combined_edges = set()
-        for t in st.session_state.defender_working_trips:
-            combined_edges.update(t["route_edges"])
-        fig = draw_network(G, edge_data, highlight_edges=combined_edges)
-        st.pyplot(fig, clear_figure=True)
+        st.info(
+            "Cost check: each trip is charged separately. So if the same route is used multiple times, "
+            "the route cost and vehicle fixed cost are counted each time."
+        )
 
     col_a, col_b = st.columns(2)
     with col_a:
-        if st.button("Clear current trips"):
+        if st.button("Clear all trips"):
             st.session_state.defender_working_trips = []
-            st.success("Current trips cleared.")
+            st.session_state.current_route_nodes = [(0, 0)]
+            st.success("All trips cleared.")
+            st.rerun()
     with col_b:
         if st.button("Save defender plan"):
             total_volume = sum(t["volume_teu"] for t in st.session_state.defender_working_trips)
@@ -428,9 +524,6 @@ Rules:
                 save_state(state)
                 st.success("Defender plan saved.")
 
-# -----------------------------
-# Attacker
-# -----------------------------
 elif role == "Attacker":
     st.subheader("Attacker panel")
     defender_trips = state.get("defender_submissions", [])
@@ -438,11 +531,9 @@ elif role == "Attacker":
 
     if current_mode == "Stackelberg":
         if defender_trips:
-            used_edges = set()
-            for t in defender_trips:
-                used_edges.update(t["route_edges"])
             st.success("Stackelberg mode: defender routes are visible to the attacker.")
-            fig = draw_network(G, edge_data, highlight_edges=used_edges)
+            route_specs = make_route_specs_from_trips(defender_trips)
+            fig = draw_network(G, edge_data, route_specs=route_specs, show_legend=True)
             st.pyplot(fig, clear_figure=True)
         else:
             st.warning("No defender plan has been saved yet.")
@@ -454,14 +545,10 @@ elif role == "Attacker":
         st.pyplot(fig, clear_figure=True)
 
     attack_count = st.radio("Number of attacks", [1, 2], horizontal=True)
-    
+
     attack_options = sorted(edge_data.keys())
-    
-    valid_default_attacks = [
-        e for e in state.get("attacks", [])
-        if e in attack_options
-    ][:attack_count]
-    
+    valid_default_attacks = [e for e in state.get("attacks", []) if e in attack_options][:attack_count]
+
     selected_attack_edges = st.multiselect(
         "Select links to attack",
         options=attack_options,
@@ -471,7 +558,8 @@ elif role == "Attacker":
     )
 
     if selected_attack_edges:
-        fig = draw_network(G, edge_data, attack_edges=set(selected_attack_edges))
+        route_specs = make_route_specs_from_trips(defender_trips) if (current_mode == "Stackelberg" and defender_trips) else []
+        fig = draw_network(G, edge_data, route_specs=route_specs, attack_edges=set(selected_attack_edges), show_legend=True)
         st.pyplot(fig, clear_figure=True)
 
     if st.button("Save attack plan"):
@@ -482,9 +570,6 @@ elif role == "Attacker":
             save_state(state)
             st.success("Attack plan saved.")
 
-# -----------------------------
-# Results
-# -----------------------------
 elif role == "Results / Referee":
     st.subheader("Results / Referee")
 
@@ -498,11 +583,8 @@ elif role == "Results / Referee":
 
     if defender_trips and attacks:
         results = evaluate_game(defender_trips, attacks, edge_data)
-
-        used_edges = set()
-        for t in defender_trips:
-            used_edges.update(t["route_edges"])
-        fig = draw_network(G, edge_data, highlight_edges=used_edges, attack_edges=set(attacks))
+        route_specs = make_route_specs_from_trips(defender_trips)
+        fig = draw_network(G, edge_data, route_specs=route_specs, attack_edges=set(attacks), show_legend=True)
         st.pyplot(fig, clear_figure=True)
 
         st.subheader("Summary")
